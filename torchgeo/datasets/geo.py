@@ -8,6 +8,9 @@ import functools
 import glob
 import os
 import re
+import xarray as xr
+import rioxarray
+from rioxarray.exceptions import NoDataInBounds
 import sys
 import warnings
 from collections.abc import Iterable, Sequence
@@ -83,7 +86,7 @@ class GeoDataset(Dataset[dict[str, Any]], abc.ABC):
        dataset = landsat7 | landsat8
     """
 
-    paths: Union[str, Iterable[str]]
+    paths: Optional[Union[str, Iterable[str]]] = None
     _crs = CRS.from_epsg(4326)
     _res = 0.0
 
@@ -320,6 +323,153 @@ class GeoDataset(Dataset[dict[str, Any]], abc.ABC):
 
         # Sort the output to enforce deterministic behavior.
         return sorted(files)
+
+
+class RioxarrayDataset(GeoDataset):
+    """Abstract base class for :class:`GeoDataset` stored as a single xarray dataset."""
+
+    #: Names of all available bands in the dataset
+    all_bands: list[str] = []
+
+    #: Names of RGB bands in the dataset, used for plotting
+    rgb_bands: list[str] = []
+
+    #: Color map for the dataset, used for plotting
+    cmap: dict[int, tuple[int, int, int, int]] = {}
+
+    #: rioxarray x dimension name
+    spatial_x_name: str = "x"
+
+    #: rioxarray y dimension name
+    spatial_y_name: str = "y"
+
+    @property
+    def dtype(self) -> torch.dtype:
+        """The dtype of the dataset (overrides the dtype of the data file via a cast).
+
+        Defaults to float32 if :attr:`~RioxarrayDataset.is_image` is True, else long.
+        Can be overridden for tasks like pixel-wise regression where the mask should be
+        float32 instead of long.
+
+        Returns:
+            the dtype of the dataset
+
+        .. versionadded:: 5.0
+        """
+        if self.is_image:
+            return torch.float32
+        else:
+            return torch.long
+
+    def __init__(
+        self,
+        dset: xr.Dataset,
+        crs: Optional[CRS] = None,
+        res: Optional[float] = None,
+        bands: Optional[Sequence[str]] = None,
+        transforms: Optional[Callable[[dict[str, Any]], dict[str, Any]]] = None,
+    ) -> None:
+        """Initialize a new RasterDataset instance.
+
+        Args:
+            dset: xarray dataset to load.
+            crs: :term:`coordinate reference system (CRS)` to warp to.
+                Note: this reprojection will likely be slow and memory-intensive,
+                since rioxarray loads the entire dataset into memory before reprojecting.
+            res: resolution of the dataset in units of CRS. Defaults to the
+                derived resolution of the dataset
+            bands: bands to return (defaults to all bands), corresponding to
+                the names of the data variables in the xarray dataset
+            transforms: a function/transform that takes an input sample
+                and returns a transformed version
+
+        Raises:
+            ValueError
+                If the CRS or res are not specified and cannot be derived from the dataset,
+                or if the bands do not confrom to
+
+        .. versionchanged:: 0.5
+           *root* was renamed to *paths*.
+        """
+        super().__init__(transforms)
+
+        self.paths = None
+        self.bands = bands or self.all_bands
+
+        if crs is None:
+            if dset.rio.crs is None:
+                raise ValueError("CRS must be specified or present in the dataset")
+            crs = CRS.from_string(dset.rio.crs)
+        else:
+            crs = cast(CRS, crs)
+
+        if res is None:
+            if dset.rio.crs is None:
+                raise ValueError(
+                    "Resolution must be specified or present in the dataset"
+                )
+            res = dset.rio.resolution[0]
+        else:
+            res = cast(float, res)
+
+        # Set spatial index and conform with rioxarray conventions.
+        dset = dset.rio.set_spatial_dims(
+            x_dim=self.spatial_x_name, y_dim=self.spatial_y_name
+        )
+        if "time" in dset.dims:
+            ordered_dims = ("time", self.spatial_y_name, self.spatial_x_name)
+        else:
+            ordered_dims = (self.spatial_y_name, self.spatial_x_name)
+        dset = dset.transpose(*ordered_dims, ...)
+
+        if dset.rio.crs is not None and dset.rio.crs != crs:
+            # NOTE: this requires loading the entire dataset into memory.
+            dset = dset.rio.reproject(crs, resolution=res)
+
+        self._crs = crs
+        self._res = res
+        self.dset = dset
+
+        # Insert the whole dataset into the index, since we are not dealing with files
+        minx, miny, maxx, maxy = dset.rio.bounds()
+        mint = dset.time.min().values.astype(float)
+        maxt = dset.time.max().values.astype(float)
+        coords = (minx, maxx, miny, maxy, mint, maxt)
+        self.index.insert(0, coords, dset)
+
+    def __getitem__(self, query: BoundingBox) -> dict[str, Any]:
+        """Retrieve image/mask and metadata indexed by query.
+
+        Args:
+            query: (minx, maxx, miny, maxy, mint, maxt) coordinates to index
+
+        Returns:
+            sample of image/mask and metadata at that index
+
+        Raises:
+            IndexError: if query is not found in the index
+        """
+
+        minx, maxx, miny, maxy = query.minx, query.maxx, query.miny, query.maxy
+        try:
+            data = self.dset.rio.clip_box(minx=minx, maxx=maxx, miny=miny, maxy=maxy)
+        except NoDataInBounds:
+            raise IndexError(
+                f"query: {query} not found in index with bounds: {self.bounds}"
+            )
+
+        data = data.to_array(dim="band").values
+        data = torch.from_numpy(data)
+        data = data.to(self.dtype)
+
+        sample = {"crs": self.crs, "bbox": query}
+        if self.is_image:
+            sample["image"] = data
+        else:
+            sample["mask"] = data
+
+        if self.transforms is not None:
+            sample = self.transforms(sample)
 
 
 class RasterDataset(GeoDataset):
