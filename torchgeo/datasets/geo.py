@@ -471,6 +471,8 @@ class RioxarrayDataset(GeoDataset):
         if self.transforms is not None:
             sample = self.transforms(sample)
 
+        return sample
+
 
 class RasterDataset(GeoDataset):
     """Abstract base class for :class:`GeoDataset` stored as raster files."""
